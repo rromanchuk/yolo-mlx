@@ -7,6 +7,7 @@ Main model class for YOLO26 detection, segmentation, pose, and OBB tasks.
 Uses MLX v0.30.3 with full compilation support.
 """
 
+import json
 import logging
 import os
 import re
@@ -104,7 +105,7 @@ class YOLO:
             logger.info(f"Building model from {self.model_path}")
 
         self.model = build_model(cfg=str(self.model_path), verbose=self.verbose)
-        self._setup_metadata()
+        self._setup_metadata({})
 
     def _map_pytorch_to_mlx_name(self, pt_name: str) -> str:
         """Map PyTorch parameter name to MLX naming convention.
@@ -226,36 +227,83 @@ class YOLO:
             return "yolo26-seg.yaml"
         return "yolo26.yaml"
 
+    @staticmethod
+    def _infer_scale_from_weights(weights: dict) -> str:
+        """Infer model scale letter from weight tensor shapes.
+
+        Reads the output-channel count of the first conv layer:
+          96 → x, 64 → l or m (distinguished by a layer-2 block key), 32 → s, 16 → n.
+        Falls back to 'n' if the key is absent (should not happen in practice).
+        """
+        l0 = weights.get("model.0.conv.weight")
+        if l0 is None:
+            return "n"
+        ch = int(l0.shape[0])
+        if ch == 96:
+            return "x"
+        if ch == 64:
+            return "l" if "model.2.m.1.cv1.conv.weight" in weights else "m"
+        if ch == 32:
+            return "s"
+        return "n"
+
+    @staticmethod
+    def _infer_nc_from_weights(weights: dict) -> int | None:
+        """Infer number of classes from the Detect head cv3 output weight."""
+        for k, v in weights.items():
+            if re.search(r"model\.\d+\.cv3\.\d+\.2\.weight$", k):
+                return int(v.shape[0])
+        return None
+
     def _load_safetensors(self):
         """Load model weights from safetensors format."""
         if self.verbose:
             logger.info(f"Loading safetensors weights from {self.model_path}")
 
-        # Extract scale from filename (e.g., yolo26n.safetensors -> n)
-        match = re.search(r"yolo26([nsmlx])", self.model_path.stem)
-        scale = match.group(1) if match else "n"
+        # Read weights and embedded metadata in one pass
+        raw_weights = dict(mx.load(str(self.model_path)))
+
+        checkpoint_meta: dict = {}
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(self.model_path), framework="numpy") as f:
+                st_meta = f.metadata() or {}
+            for k, v in st_meta.items():
+                try:
+                    checkpoint_meta[k] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    checkpoint_meta[k] = v
+        except ImportError:
+            pass
+
+        # scale: metadata → filename regex → shape inference
+        scale = checkpoint_meta.get("scale")
+        if not scale:
+            match = re.search(r"yolo26([nsmlx])", self.model_path.stem)
+            scale = match.group(1) if match else self._infer_scale_from_weights(raw_weights)
+
+        # nc: metadata → shape inference
+        nc = checkpoint_meta.get("nc") or self._infer_nc_from_weights(raw_weights)
 
         cfg = self._get_model_cfg()
+        build_kwargs: dict = {"cfg": cfg, "verbose": self.verbose, "scale": scale}
+        if nc is not None:
+            build_kwargs["nc"] = nc
         try:
-            self.model = build_model(cfg=cfg, verbose=self.verbose, scale=scale)
+            self.model = build_model(**build_kwargs)
         except FileNotFoundError:
             self.model = build_model(cfg=cfg, verbose=self.verbose)
 
-        # Load weights with name mapping
-        weights = dict(mx.load(str(self.model_path)))
-        mapped_weights = [(self._map_pytorch_to_mlx_name(k), v) for k, v in weights.items()]
-
-        # Get MLX model parameter names
+        mapped_weights = [(self._map_pytorch_to_mlx_name(k), v) for k, v in raw_weights.items()]
         mlx_param_names = self._get_param_names(self.model.parameters())
-
-        # Filter to only matching weights
         matching_weights = [(k, v) for k, v in mapped_weights if k in mlx_param_names]
 
         if self.verbose:
             logger.info(f"  Matching weights: {len(matching_weights)}/{len(mapped_weights)}")
 
         self.model.load_weights(matching_weights, strict=False)
-        self._setup_metadata()
+        self._setup_metadata(checkpoint_meta)
 
         if self.verbose:
             logger.info("Loaded weights successfully")
@@ -265,31 +313,41 @@ class YOLO:
         if self.verbose:
             logger.info(f"Loading npz weights from {self.model_path}")
 
-        # Extract scale from filename (e.g., yolo26n.npz -> n)
-        match = re.search(r"yolo26([nsmlx])", self.model_path.stem)
-        scale = match.group(1) if match else "n"
+        raw_weights = dict(mx.load(str(self.model_path)))
+
+        # Read __metadata__ written by the converter (JSON-encoded string array)
+        checkpoint_meta: dict = {}
+        meta_arr = raw_weights.pop("__metadata__", None)
+        if meta_arr is not None:
+            try:
+                checkpoint_meta = json.loads(str(meta_arr))
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        # scale: metadata → shape inference (filename regex is unreliable)
+        scale = checkpoint_meta.get("scale") or self._infer_scale_from_weights(raw_weights)
+
+        # nc: metadata → shape inference
+        nc = checkpoint_meta.get("nc") or self._infer_nc_from_weights(raw_weights)
 
         cfg = self._get_model_cfg()
+        build_kwargs: dict = {"cfg": cfg, "verbose": self.verbose, "scale": scale}
+        if nc is not None:
+            build_kwargs["nc"] = nc
         try:
-            self.model = build_model(cfg=cfg, verbose=self.verbose, scale=scale)
+            self.model = build_model(**build_kwargs)
         except FileNotFoundError:
             self.model = build_model(cfg=cfg, verbose=self.verbose)
 
-        # Load weights with name mapping
-        weights = dict(mx.load(str(self.model_path)))
-        mapped_weights = [(self._map_pytorch_to_mlx_name(k), v) for k, v in weights.items()]
-
-        # Get MLX model parameter names
+        mapped_weights = [(self._map_pytorch_to_mlx_name(k), v) for k, v in raw_weights.items()]
         mlx_param_names = self._get_param_names(self.model.parameters())
-
-        # Filter to only matching weights
         matching_weights = [(k, v) for k, v in mapped_weights if k in mlx_param_names]
 
         if self.verbose:
             logger.info(f"  Matching weights: {len(matching_weights)}/{len(mapped_weights)}")
 
         self.model.load_weights(matching_weights, strict=False)
-        self._setup_metadata()
+        self._setup_metadata(checkpoint_meta)
 
         if self.verbose:
             logger.info("Loaded weights successfully")
@@ -299,30 +357,30 @@ class YOLO:
         if self.verbose:
             logger.info(f"Converting PyTorch weights from {self.model_path}")
 
-        cfg = self._get_model_cfg()
-        match = re.search(r"yolo26([nsmlx])", self.model_path.stem)
-        scale = match.group(1) if match else "n"
-
-        try:
-            self.model = build_model(cfg=cfg, verbose=self.verbose, scale=scale)
-        except FileNotFoundError:
-            self.model = build_model(cfg=cfg, verbose=self.verbose)
-
-        # Convert and load weights
+        # Convert first so the safetensors header carries metadata
         output_path = self.model_path.with_suffix(".safetensors")
         convert_yolo26_weights(str(self.model_path), str(output_path), verbose=self.verbose)
 
-        self.model.load_weights(str(output_path))
-        self._setup_metadata()
+        # Delegate to _load_safetensors which reads the embedded metadata
+        orig_path = self.model_path
+        self.model_path = output_path
+        self._load_safetensors()
+        self.model_path = orig_path
 
         if self.verbose:
             logger.info("Converted and loaded weights successfully")
 
-    def _setup_metadata(self):
+    def _setup_metadata(self, checkpoint_meta: dict | None = None):
         """Setup model metadata (nc, stride, names) after loading."""
-        if self.model is not None:
-            self.nc = getattr(self.model, "nc", 80)
-            self.stride = getattr(self.model, "stride", mx.array([8.0, 16.0, 32.0]))
+        if self.model is None:
+            return
+        meta = checkpoint_meta or {}
+        self.nc = getattr(self.model, "nc", meta.get("nc", 80))
+        self.stride = getattr(self.model, "stride", mx.array([8.0, 16.0, 32.0]))
+        # Prefer names from checkpoint metadata (preserves actual class strings)
+        if "names" in meta:
+            self.names = {int(k): str(v) for k, v in meta["names"].items()}
+        else:
             self.names = getattr(self.model, "names", {i: f"class{i}" for i in range(self.nc)})
 
     def predict(
