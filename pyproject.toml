@@ -28,15 +28,7 @@ classifiers = [
 ]
 requires-python = ">=3.10"
 dependencies = [
-    # Upper bound on mlx: yolo26x-seg training reproducibly hangs on
-    # mlx 0.31.x (kIOGPUCommandBufferCallbackError) within 2–5 epochs
-    # despite the per-epoch ``mx.clear_cache()`` Metal-heap-fragmentation
-    # fix in ``yolo26mlx.engine.trainer``. Smaller seg models (n/s/m/l)
-    # and all detection workloads are unaffected, and the documented
-    # 81.5 s/epoch x-seg baseline was measured under mlx 0.30.x — so the
-    # supported floor is the same and the cap excludes only the broken
-    # 0.31.x line.
-    "mlx>=0.30.3,<0.31",
+    "mlx>=0.30.3",
     "numpy>=2.0.0",
     "pillow>=10.0.0",
     "pyyaml>=6.0",
