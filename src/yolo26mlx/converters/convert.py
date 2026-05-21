@@ -34,6 +34,7 @@ Usage:
     weights = convert_yolo26_weights("yolo26n.pt", "yolo26n.safetensors")
 """
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -229,6 +230,72 @@ def convert_name_pytorch_to_mlx(pt_name: str) -> str:
     return pt_name
 
 
+def extract_checkpoint_metadata(pt_checkpoint) -> dict:
+    """Extract model metadata from a PyTorch checkpoint.
+
+    Returns a plain dict with string-serialisable values pulled from the
+    embedded model object and training args.  All callers should treat every
+    key as optional — older or third-party checkpoints may omit some fields.
+
+    Keys returned (when present):
+        nc        int   — number of classes
+        scale     str   — model scale letter (n/s/m/l/x)
+        names     dict  — {int: str} class-name mapping
+        stride    list  — detection strides, e.g. [8, 16, 32]
+        task      str   — 'detect' | 'segment' | 'pose' | 'obb'
+        end2end   bool  — whether the head uses end-to-end mode
+        reg_max   int   — DFL bins (1 = no DFL)
+        imgsz     int   — training image size
+    """
+    model = None
+    if isinstance(pt_checkpoint, dict):
+        model = pt_checkpoint.get("model")
+    if model is None and hasattr(pt_checkpoint, "yaml"):
+        model = pt_checkpoint
+    if model is None:
+        return {}
+
+    meta = {}
+
+    if hasattr(model, "nc"):
+        meta["nc"] = int(model.nc)
+
+    if hasattr(model, "names"):
+        names = model.names
+        # ultralytics stores names as {int: str} — keep as-is
+        meta["names"] = {int(k): str(v) for k, v in names.items()}
+
+    if hasattr(model, "stride"):
+        stride = model.stride
+        meta["stride"] = stride.tolist() if hasattr(stride, "tolist") else list(stride)
+
+    if hasattr(model, "task"):
+        meta["task"] = str(model.task)
+
+    if hasattr(model, "yaml") and isinstance(model.yaml, dict):
+        yaml = model.yaml
+        for key in ("scale", "end2end", "reg_max"):
+            if key in yaml:
+                meta[key] = yaml[key]
+        if "nc" not in meta and "nc" in yaml:
+            meta["nc"] = int(yaml["nc"])
+
+    # Training imgsz if available
+    train_args = None
+    if isinstance(pt_checkpoint, dict):
+        train_args = pt_checkpoint.get("train_args")
+    if train_args is not None:
+        imgsz = (
+            getattr(train_args, "imgsz", None)
+            if not isinstance(train_args, dict)
+            else train_args.get("imgsz")
+        )
+        if imgsz is not None:
+            meta["imgsz"] = int(imgsz) if not isinstance(imgsz, (list, tuple)) else imgsz
+
+    return meta
+
+
 def convert_yolo26_weights(
     pt_path: str, output_path: str | None = None, verbose: bool = True
 ) -> list[tuple[str, mx.array]]:
@@ -255,6 +322,11 @@ def convert_yolo26_weights(
 
     # Load PyTorch weights
     pt_checkpoint = torch.load(pt_path, map_location="cpu", weights_only=False)
+
+    # Extract metadata before touching state_dict (model object still intact)
+    checkpoint_meta = extract_checkpoint_metadata(pt_checkpoint)
+    if verbose and checkpoint_meta:
+        logger.info(f"Checkpoint metadata: {list(checkpoint_meta.keys())}")
 
     # Extract state dict from various checkpoint formats
     if isinstance(pt_checkpoint, dict):
@@ -345,13 +417,14 @@ def convert_yolo26_weights(
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         if output_path.suffix == ".safetensors":
-            # Save as safetensors
+            # Save as safetensors — metadata goes in the file header as str→str dict
             try:
                 from safetensors.numpy import save_file
 
-                # Convert to dict with numpy arrays
                 np_dict = {name: np.array(arr) for name, arr in mlx_weights}
-                save_file(np_dict, str(output_path))
+                # safetensors metadata values must be strings
+                st_meta = {k: json.dumps(v) for k, v in checkpoint_meta.items()}
+                save_file(np_dict, str(output_path), metadata=st_meta)
                 if verbose:
                     logger.info(f"\nSaved MLX weights to {output_path} (safetensors)")
             except ImportError:
@@ -365,6 +438,9 @@ def convert_yolo26_weights(
             # weights, so route through np.savez (pure-Python kwargs, identical
             # .npz archive layout consumed by Module.load_weights).
             weight_dict = {name: np.array(arr) for name, arr in mlx_weights}
+            # npz has no header — store metadata as a JSON-encoded array entry
+            if checkpoint_meta:
+                weight_dict["__metadata__"] = np.array(json.dumps(checkpoint_meta))
             np.savez(str(output_path), **weight_dict)
             if verbose:
                 logger.info(f"\nSaved MLX weights to {output_path} (npz)")
